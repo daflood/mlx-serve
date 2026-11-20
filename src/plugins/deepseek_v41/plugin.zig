@@ -506,13 +506,51 @@ fn eachAlone(m: *Model, f: *const abi.Forward) !mlx.mlx_array {
 
 /// The legacy seam's arms: position 0 starts a request (a resumed one arrives past 0); a decode token stays on the
 /// GPU (`dev`, or the host id uploaded); everything else extends the state. `all` returns every row's logits.
+fn xNow() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+}
+var xs_n: u64 = 0;
+var xs_sum: i128 = 0;
+/// exp: the per-step token sync to the host under a tensor split (the wait for the step's eval), averaged over 256.
+fn xSync(d: i128) void {
+    xs_n += 1;
+    xs_sum += d;
+    if (xs_n == 256) {
+        std.log.info("[xt] host token sync (eval wait): {d} us avg over 256", .{@divTrunc(xs_sum, 256_000)});
+        xs_n = 0;
+        xs_sum = 0;
+    }
+}
+
+var xg_n: u64 = 0;
+var xg_in: i128 = 0;
+var xg_first: i128 = 0;
+/// exp: rank 0's gpu-token (piped) decode steps under a tensor split: the call's own time (graph build + encode) and the
+/// period between calls, averaged over 256.
+fn xGpuStep(t0: i128) void {
+    const now = xNow();
+    if (xg_n == 0) xg_first = t0;
+    xg_n += 1;
+    xg_in += now - t0;
+    if (xg_n == 256) {
+        std.log.info("[xt] host gpu-token step: in-call {d} us, period {d} us (256 steps)", .{ @divTrunc(xg_in, 256_000), @divTrunc(now - xg_first, 256_000) });
+        xg_n = 0;
+        xg_in = 0;
+    }
+}
+
 fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.VisionRows, dev: mlx.mlx_array) !mlx.mlx_array {
     const mdl = m.mdl;
     var one: [1]u32 = undefined;
     const image_row = rows != null and std.mem.indexOfScalar(u32, host_ids, m.cfg.image_token_id) != null;
-    const gpu_decode = !all and pos > 0 and (dev.ctx != null or host_ids.len == 1) and mdl.pair == null and (mdl.tp == null or (dsv41.tpPipeOn() and !image_row));
+    // DSV41_NO_GPU_DECODE=1: one Mac syncs its token to the host every step, as a non-piped tensor split does (timing experiment).
+    const gpu_decode = std.c.getenv("DSV41_NO_GPU_DECODE") == null and !all and pos > 0 and (dev.ctx != null or host_ids.len == 1) and mdl.pair == null and (mdl.tp == null or (dsv41.tpPipeOn() and !image_row));
     const ids = if (dev.ctx != null and !gpu_decode) blk: {
+        const xs0 = xNow();
         one[0] = try v4plugin.hostToken(dev);
+        if (mdl.tp != null) xSync(xNow() - xs0);
         if (one[0] >= m.cfg.vocab_size) return error.TokenPastVocabulary;
         break :blk one[0..];
     } else host_ids;
@@ -525,6 +563,8 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
             break :blk2 mlx.mlx_array_new_data(&id, &[_]c_int{ 1, 1 }, 2, .int32);
         };
         defer _ = mlx.mlx_array_free(tok);
+        const xg0 = xNow();
+        defer if (mdl.tp != null) xGpuStep(xg0);
         break :blk try dsv41.extendResumableGpu(mdl, gpa, tok);
     } else try runPrompt(m, ids, pos, rows);
     defer _ = mlx.mlx_array_free(logits);
@@ -696,7 +736,9 @@ fn auxRestoreAt(mp: *anyopaque, slot: u32, handle: abi.Handle, pos: u64) callcon
     if (pos != sn.n or sn.n != sn.ids.len) return Verdict.refuse(.unsupported, "deepseek_v41: restore requires the snapshot's exact position");
     const m: *Model = @ptrCast(@alignCast(mp));
     var fresh = dsv41.stateFromSnapshot(m.mdl, gpa, sn) catch |e| return Verdict.named(.failed, @errorName(e));
-    if (!sn.whole) dsv41.rewind(m.mdl, gpa, &fresh, sn.ids) catch |e| {
+    // A tensor split replays the slice's last window once the state is the module's and the other ranks hold theirs.
+    const tp_rewind = !sn.whole and m.mdl.tp != null;
+    if (!sn.whole and !tp_rewind) dsv41.rewind(m.mdl, gpa, &fresh, sn.ids) catch |e| {
         fresh.deinit();
         return Verdict.named(.failed, @errorName(e));
     };
@@ -712,6 +754,7 @@ fn auxRestoreAt(mp: *anyopaque, slot: u32, handle: abi.Handle, pos: u64) callcon
     m.mdl.gens += 1;
     m.mdl.state_gen = m.mdl.gens;
     dsv41.tpSnap(m.mdl, .restore, sn.tp_id, m.mdl.state_gen);
+    if (tp_rewind) dsv41.rewind(m.mdl, gpa, &m.mdl.dec_state.?, sn.ids) catch |e| return Verdict.named(.failed, @errorName(e));
     return .ok;
 }
 
@@ -730,7 +773,10 @@ fn auxSlice(mp: *anyopaque, handle: abi.Handle, len: u64, out: *abi.Handle) call
     if (sn.tp_id != 0) {
         m.tp_snaps += 1;
         owned.tp_id = m.tp_snaps;
-        dsv41.tpSnap(m.mdl, .clone, sn.tp_id, owned.tp_id);
+        if (owned.n == sn.n) dsv41.tpSnap(m.mdl, .clone, sn.tp_id, owned.tp_id) else {
+            dsv41.tpSnap(m.mdl, .cut, owned.n, 0);
+            dsv41.tpSnap(m.mdl, .slice, sn.tp_id, owned.tp_id);
+        }
     }
     out.* = owned;
     return .ok;

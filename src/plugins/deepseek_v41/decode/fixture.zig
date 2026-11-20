@@ -1027,8 +1027,8 @@ const Ops = struct {
     var list: std.ArrayList(Op) = .empty;
     var live: ?struct { gen: u64, n: usize } = null;
 
-    fn step(ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64, images: ?A) anyerror!void {
-        if (images != null) return error.TestUnexpectedResult;
+    fn step(ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64, images: ?A, replay: bool) anyerror!void {
+        if (images != null or replay) return error.TestUnexpectedResult;
         const own = try std.testing.allocator.dupe(u32, ids);
         errdefer std.testing.allocator.free(own);
         try list.append(std.testing.allocator, .{ .step = .{ .ids = own, .p0 = p0, .snap = snap, .all = all, .verify = verify, .gen = gen } });

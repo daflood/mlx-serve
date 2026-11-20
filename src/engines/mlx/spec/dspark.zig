@@ -8,6 +8,7 @@ const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
+const xt_log = @import("../../../sdk/util/log.zig");
 const dflash_policy = @import("dflash/policy.zig");
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -213,9 +214,11 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     const pol = &self.dspark_pol.?;
     const st = &mdl.dec_state.?;
     const t1 = self.next_token_id;
+    ExpSpark.plain(&pol.plain);
     var d = try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
     defer d.deinit(allocator);
-    d.len = if (pol.pin_rows > 0) @min(d.len, pol.pin_rows - 1) else dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
+    // DSV41_SPARK_PIN=n: every round verifies n rows (the trunk token and n - 1 drafts), whatever the confidence.
+    d.len = if (pol.pin_rows > 0) @min(d.len, pol.pin_rows - 1) else if (ExpSpark.pin() > 0) @min(d.len, ExpSpark.pin() - 1) else dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
     // An exact verify stays within the decode-width rows (`maxVerifyDrafts`; the block itself otherwise).
     d.len = @min(d.len, dsv41_mod.maxVerifyDrafts(mdl));
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
@@ -230,8 +233,78 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     self.dspark_stats.record(@intCast(d.len), round.accepted);
     const wall_ms = @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms);
     pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, wall_ms);
+    ExpSpark.note(d.len + 1, wall_ms, round.accepted, pol.plain.ms);
     return self.commitDsparkRound(allocator, round, st.n);
 }
+
+// DSpark round stats by verify rows (logged every 256 rounds), and DSV41_SPARK_COST="a,b": the verify ladder
+// replaced by cost(1) = plain, cost(r) = plain * (a + b * (r - 2)) for r >= 2 (a split step costs about the same
+// host time at any width, so the single-Mac ladder under-verifies there).
+const ExpSpark = struct {
+    var n: [17]u32 = @splat(0);
+    var ms: [17]f32 = @splat(0);
+    var acc: [17]u32 = @splat(0);
+    var total: u32 = 0;
+    var state: i8 = -1;
+    var a: f32 = 0;
+    var b: f32 = 0;
+
+    fn note(rows: usize, wall_ms: f32, accepted: usize, plain_ms: f32) void {
+        const r = @min(rows, 16);
+        n[r] += 1;
+        ms[r] += wall_ms;
+        acc[r] += @intCast(accepted);
+        total += 1;
+        if (total % 256 != 0) return;
+        var buf: [600]u8 = undefined;
+        var w: usize = 0;
+        for (1..9) |k| if (n[k] > 0) {
+            const t = std.fmt.bufPrint(buf[w..], " {d}r:{d}x{d:.2}ms+{d:.2}", .{ k, n[k], ms[k] / @as(f32, @floatFromInt(n[k])), @as(f32, @floatFromInt(acc[k])) / @as(f32, @floatFromInt(n[k])) }) catch break;
+            w += t.len;
+        };
+        xt_log.info("[xt] dspark rounds by rows (count x mean ms + mean accepted), plain {d:.2} ms:{s}\n", .{ plain_ms, buf[0..w] });
+        n = @splat(0);
+        ms = @splat(0);
+        acc = @splat(0);
+    }
+
+    var c1: f32 = 1;
+    var pin_n: usize = 0;
+    fn pin() usize {
+        load();
+        return pin_n;
+    }
+    var plain0: f32 = 0;
+
+    fn load() void {
+        if (state >= 0) return;
+        state = 0;
+        if (std.c.getenv("DSV41_SPARK_PIN")) |e| pin_n = std.fmt.parseInt(usize, std.mem.span(e), 10) catch 0;
+        if (std.c.getenv("DSV41_SPARK_PLAIN_MS")) |e| plain0 = std.fmt.parseFloat(f32, std.mem.span(e)) catch 0;
+        if (std.c.getenv("DSV41_SPARK_COST")) |e| {
+            var it = std.mem.splitScalar(u8, std.mem.span(e), ',');
+            c1 = std.fmt.parseFloat(f32, it.next() orelse "") catch 0;
+            a = std.fmt.parseFloat(f32, it.next() orelse "") catch 0;
+            b = std.fmt.parseFloat(f32, it.next() orelse "") catch 0;
+            if (c1 > 0 and a > 0) state = 1;
+        }
+        if (state == 1 or plain0 > 0) xt_log.info("[xt] DSpark policy: cost(1) = plain * {d:.3}, cost(r) = plain * ({d:.3} + {d:.3} (r - 2)), on={d}; plain prior {d:.2} ms (0 = built-in)\n", .{ c1, a, b, state, plain0 });
+    }
+
+    /// DSV41_SPARK_PLAIN_MS: the plain step this machine really takes, in place of the built-in prior a request starts from.
+    fn plain(pc: *dflash_policy.PlainCost) void {
+        load();
+        if (plain0 > 0 and pc.ms == (dflash_policy.PlainCost{}).ms) pc.ms = plain0;
+    }
+
+    /// DSV41_SPARK_COST="c1,a,b": round ms by verify rows as multiples of the plain step.
+    fn costs(out: *dflash_policy.Costs, plain_ms: f32) void {
+        load();
+        if (state != 1) return;
+        out[1] = plain_ms * c1;
+        for (2..out.len) |r| out[r] = plain_ms * (a + b * @as(f32, @floatFromInt(r - 2)));
+    }
+};
 
 pub fn sigmoid(x: f32) f32 {
     return 1 / (1 + @exp(-x));
@@ -243,7 +316,8 @@ pub fn dsparkVerifyDrafts(conf_logits: []const f32, calib: *const dflash_policy.
     var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
     const n = @min(conf_logits.len, p.len);
     for (conf_logits[0..n], p[0..n]) |c, *o| o.* = calib.probability(sigmoid(c));
-    const costs = dflash_policy.priorCosts(plain_ms);
+    var costs = dflash_policy.priorCosts(plain_ms);
+    ExpSpark.costs(&costs, plain_ms);
     return dflash_policy.chooseRows(p[0..n], &costs).rows - 1;
 }
 

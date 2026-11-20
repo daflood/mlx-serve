@@ -272,8 +272,28 @@ pub const GroupCost = struct {
 
     scale: f32 = 1,
 
+    /// exp: DSV41_GROUP_COST=base,per_state,per_row[,cliff] replaces the prior (ms); `cliff` is added to a verify of
+    /// more than 6 rows (a tensor split's fused decode kernels serve 6).
+    var env_prior: [4]f32 = .{ BASE, PER_STATE, PER_ROW, 0 };
+    var env_read: bool = false;
+    fn envPrior() *const [4]f32 {
+        if (!env_read) {
+            env_read = true;
+            if (std.c.getenv("DSV41_GROUP_COST")) |v| {
+                var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
+                var i: usize = 0;
+                while (it.next()) |part| : (i += 1) {
+                    if (i >= 4) break;
+                    env_prior[i] = std.fmt.parseFloat(f32, part) catch env_prior[i];
+                }
+            }
+        }
+        return &env_prior;
+    }
+
     fn prior(states: usize, rows: usize) f32 {
-        return BASE + PER_STATE * @as(f32, @floatFromInt(states)) + PER_ROW * @as(f32, @floatFromInt(rows -| states));
+        const c = envPrior();
+        return c[0] + c[1] * @as(f32, @floatFromInt(states)) + c[2] * @as(f32, @floatFromInt(rows -| states)) + (if (rows > 6) c[3] else 0);
     }
 
     pub fn ms(self: *const GroupCost, states: usize, rows: usize) f32 {
@@ -282,7 +302,7 @@ pub const GroupCost = struct {
 
     /// What one more verify row costs.
     pub fn rowMs(self: *const GroupCost) f32 {
-        return self.scale * PER_ROW;
+        return self.scale * envPrior()[2];
     }
 
     /// The verify's ms by rows for a group of `states` slots (index = rows, below `states` unused).

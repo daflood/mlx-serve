@@ -86,7 +86,22 @@ pub fn deviceMatrixJson(cfg: Config, out: []u8) ![]const u8 {
         try w.writeByte('[');
         for (0..cfg.size) |c| {
             if (c != 0) try w.writeByte(',');
-            if (r == c) try w.writeAll("null") else try w.print("\"{s}\"", .{list[if (c == cfg.rank) r else c]});
+            if (r == c) try w.writeAll("null") else {
+                // "rdma_enA+rdma_enB": several cables to that rank, in the same order on both ends. JACCL
+                // stripes messages of 512 KiB and more across them (prefill's whole-chunk sums).
+                const name = list[if (c == cfg.rank) r else c];
+                if (std.mem.indexOfScalar(u8, name, '+') == null) try w.print("\"{s}\"", .{name}) else {
+                    try w.writeByte('[');
+                    var it = std.mem.splitScalar(u8, name, '+');
+                    var first = true;
+                    while (it.next()) |part| {
+                        if (!first) try w.writeByte(',');
+                        first = false;
+                        try w.print("\"{s}\"", .{part});
+                    }
+                    try w.writeByte(']');
+                }
+            }
         }
         try w.writeByte(']');
     }
@@ -299,6 +314,9 @@ const Bell = struct {
 
     /// A worker's bell: connected, then its rank.
     fn connect(coord: Coordinator, rank: u32) Bell {
+        // DSV41_NO_BELL=1: no bell, so the worker waits on the RDMA link (one core busy) and no step waits
+        // for a TCP byte to cross. The piped step needs the bell and is off without it.
+        if (std.c.getenv("DSV41_NO_BELL") != null) return .{};
         const fd = lan.connectTimeout(coord.ip4, coord.port +% 1, 3000) catch return .{};
         const b: Bell = .{ .fd = noDelay(fd) };
         b.writeAll(&[_]u8{@intCast(rank)}) catch {
@@ -1100,6 +1118,9 @@ fn tensorShare(whole: u64, size: u32) u64 {
 
 fn shareFor(g: Group, config: *const model_mod.ModelConfig, whole: u64, mine: u64, theirs: u64) u64 {
     const n: u64 = config.num_hidden_layers;
+    // exp: DSV41_TP_SHARE=1 bills a joined tensor split at this rank's share before the worker has reported its free
+    // memory (a pack past one Mac's limit was refused whole: `theirs` is still 0 at the first load).
+    if (theirs == 0 and config.isDsv41() and g.mode == .tensor) if (std.c.getenv("DSV41_TP_SHARE")) |e| if (e[0] == '1') return tensorShare(whole, g.size);
     if (theirs == 0) return whole;
     if (config.isDsv41()) {
         if (g.mode == .tensor) return tensorShare(whole, g.size);
@@ -1307,7 +1328,30 @@ fn dsv41TpSum(x: mlx.mlx_array) anyerror!mlx.mlx_array {
     const link = cluster().tp_link orelse return error.DistWorkerNotJoined;
     cluster().tp_sums += 1;
     cluster().tp_values += mlx.mlx_array_size(x);
+    // Timing-only experiment: skip the collective (WRONG output). Both ranks must set it alike.
+    if (fakeSum()) {
+        const two = mlx.mlx_array_new_float(2.0);
+        defer _ = mlx.mlx_array_free(two);
+        const gs = mlx.mlx_default_gpu_stream_new();
+        defer _ = mlx.mlx_stream_free(gs);
+        var r = mlx.mlx_array_new();
+        var c = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(c);
+        try mlx.check(mlx.mlx_astype(&c, two, mlx.mlx_array_dtype(x), gs));
+        try mlx.check(mlx.mlx_multiply(&r, x, c, gs));
+        return r;
+    }
     return link.allSum(x);
+}
+
+var fake_sum_state: i8 = -1;
+fn fakeSum() bool {
+    if (fake_sum_state < 0) {
+        const v = std.c.getenv("DSV41_TP_FAKESUM");
+        fake_sum_state = if (v != null and v.?[0] == '1') 1 else 0;
+        if (fake_sum_state == 1) log.info("[dist] DSV41_TP_FAKESUM=1: all_sums skipped (timing only, wrong output)\n", .{});
+    }
+    return fake_sum_state == 1;
 }
 
 /// DeepSeek-V4.1 tensor, every rank: every rank's `x` stacked on axis 0 in rank order, lazily on this thread's CPU
@@ -1326,16 +1370,62 @@ fn noteTpStep(p0: usize, rows: usize) void {
     c.tp_last = .{ .p0 = p0, .rows = rows };
 }
 
+// exp timers: averages every 256 one-row steps (us). host: period between step sends, time inside the send.
+// worker: idle between steps (waiting for rank 0), time inside tpWorkerStep (graph build + whatever it evals).
+pub fn xNowNs() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+}
+var x_last: i128 = 0;
+var x_n: u64 = 0;
+var x_a: i128 = 0;
+var x_b: i128 = 0;
+var x_wide: u64 = 0;
+var x_wide_ns: i128 = 0;
+fn xAcc(who: []const u8, a: i128, b: i128, rows: usize) void {
+    if (rows != 1) {
+        x_wide += 1;
+        x_wide_ns += b;
+        return;
+    }
+    x_n += 1;
+    x_a += a;
+    x_b += b;
+    if (x_n == 256) {
+        log.info("[xt] {s}: 256 one-row steps: gap {d} us, in-call {d} us; wide calls {d}, avg in-call {d} us\n", .{ who, @divTrunc(x_a, 256_000), @divTrunc(x_b, 256_000), x_wide, if (x_wide > 0) @divTrunc(x_wide_ns, @as(i128, x_wide) * 1000) else 0 });
+        x_n = 0;
+        x_a = 0;
+        x_b = 0;
+        x_wide = 0;
+        x_wide_ns = 0;
+    }
+}
+fn xHostStep(t0: i128, rows: usize) void {
+    const now = xNowNs();
+    const gap = if (x_last != 0) t0 - x_last else 0;
+    x_last = t0;
+    xAcc("host period/send", gap, now - t0, rows);
+}
+fn xWorkerStep(t0: i128, rows: usize) void {
+    const now = xNowNs();
+    const idle = if (x_last != 0) t0 - x_last else 0;
+    x_last = now;
+    xAcc("worker idle/step", idle, now - t0, rows);
+}
+
 /// Host, DeepSeek-V4.1 tensor: one step's ids to the worker, which runs the same forward on its halves.
-fn dsv41TpStep(ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64, images: ?mlx.mlx_array) anyerror!void {
+fn dsv41TpStep(ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64, images: ?mlx.mlx_array, replay: bool) anyerror!void {
     const self = peer() orelse return error.DistWorkerNotJoined;
     if (!self.ready) try self.awaitReady();
     noteTpStep(p0, ids.len);
+    const xt0 = xNowNs();
+    defer xHostStep(xt0, ids.len);
     // Ids fit an int32 (the vocabulary is checked before any forward).
     const a = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .int32);
     defer _ = mlx.mlx_array_free(a);
     self.exchanges += 1;
-    const flags = @as(i32, @intFromBool(snap)) | @as(i32, @intFromBool(all)) << 1 | @as(i32, @intFromBool(verify)) << 2 | @as(i32, @intFromBool(images != null)) << 3;
+    const flags = @as(i32, @intFromBool(snap)) | @as(i32, @intFromBool(all)) << 1 | @as(i32, @intFromBool(verify)) << 2 | @as(i32, @intFromBool(images != null)) << 3 | @as(i32, @intFromBool(replay)) << 4;
     // Sent now, on the CPU stream alone: `sendOrdered` chains its sends through the GPU stream, and a GPU wait on a send
     // that blocks until the worker's receive deadlocked MLX's fast fences. Each worker gets its whole step before the
     // next, and all of them before this rank builds the step's first sum: a worker blocks only in a sum, which needs
@@ -1655,7 +1745,9 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
                 };
                 if (msg[4] & 8 != 0) images = try queuedRecv(link, &.{ @intCast(m.imageRows(ids)), @intCast(m.cfg.hidden_size) }, m.act, 0);
                 noteTpStep(p0, L);
-                try dsv41_mod.tpWorkerStep(m, allocator, &parked, joined(msg[6], msg[7]), ids, p0, msg[4] & 1 != 0, if (msg[4] & 2 != 0) .all else .last, msg[4] & 4 != 0, if (images.ctx != null) images else null);
+                const xw0 = xNowNs();
+                defer xWorkerStep(xw0, L);
+                try dsv41_mod.tpWorkerStep(m, allocator, &parked, joined(msg[6], msg[7]), ids, p0, msg[4] & 1 != 0, if (msg[4] & 16 != 0) .replay else if (msg[4] & 2 != 0) .all else .last, msg[4] & 4 != 0, if (images.ctx != null) images else null);
                 steps += 1;
             },
             OP_DSV41_TP_PIPE => {

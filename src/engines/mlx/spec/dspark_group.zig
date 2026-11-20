@@ -172,7 +172,7 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         const found = idx.matchBest(t1, @intCast(dsv41_mod.maxVerifyDrafts(mdl)));
         const copy = dsparkCopyLen(found, gen.max_tokens -| gen.completion_tokens -| 1, mdl.ds_block);
         // A group with no row to spare verifies no stage draft: it drafts none.
-        const stage = copy == 0 and n < dflash_policy.MAX_GROUP_ROWS and if (gen.dspark_pol) |*pol| pol.drafting.shouldDraft() else true;
+        const stage = copy == 0 and n < dflash_policy.MAX_GROUP_ROWS and (groupDraftAlways(n) or if (gen.dspark_pol) |*pol| pol.drafting.shouldDraft() else true);
         kinds[k] = if (copy > 0) .copy else if (stage) .stage else .plain;
         if (stage) {
             staged[n_stage] = k;
@@ -287,6 +287,7 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         }
     }
     cost.sample(n, rows, msOf(verify_watch.read()));
+    xtGroup(n, rows, msOf(verify_watch.read()), draft_ms, cost.scale);
 
     // Each slot keeps its prefix, and teaches its drafting backoff what drafting cost the round (its share of the draft,
     // its rows) against what its accepted drafts saved (the group's plain step a token).
@@ -320,6 +321,42 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         const spent = draft_ms / @as(f32, @floatFromInt(n_stage)) + @as(f32, @floatFromInt(b)) * cost.rowMs();
         pol.drafting.record(@as(f32, @floatFromInt(a)) * token_ms, spent);
     };
+}
+
+/// exp: DSV41_GROUP_DRAFT=<n> drafts every round in groups of up to n slots, whatever each slot's backoff says (the
+/// backoff prices a slot's draft alone; a batched draft costs about the same for one slot as for four).
+var group_draft_max: ?usize = null;
+fn groupDraftAlways(n: usize) bool {
+    if (group_draft_max == null) group_draft_max = if (std.c.getenv("DSV41_GROUP_DRAFT")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0 else 0;
+    return n <= group_draft_max.?;
+}
+
+// [xt] exp: what group rounds cost by (slots, rows), logged every 512 rounds.
+var xt_n: [5][17]u32 = @splat(@splat(0));
+var xt_ms: [5][17]f32 = @splat(@splat(0));
+var xt_draft: [5]f32 = @splat(0);
+var xt_drafts: [5]u32 = @splat(0);
+var xt_rounds: u32 = 0;
+fn xtGroup(n: usize, rows: usize, took: f32, draft_ms: f32, scale: f32) void {
+    if (n > 4 or rows > 16) return;
+    xt_n[n][rows] += 1;
+    xt_ms[n][rows] += took;
+    if (draft_ms > 0) {
+        xt_draft[n] += draft_ms;
+        xt_drafts[n] += 1;
+    }
+    xt_rounds += 1;
+    if (xt_rounds % 512 != 0) return;
+    for (1..5) |k| {
+        var buf: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        var any = false;
+        for (k..17) |r| if (xt_n[k][r] > 0) {
+            any = true;
+            w.print(" {d}r:{d}x{d:.2}", .{ r, xt_n[k][r], xt_ms[k][r] / @as(f32, @floatFromInt(xt_n[k][r])) }) catch break;
+        };
+        if (any) log.info("[xt] group {d} slots, verify ms by rows:{s}; draft {d}x{d:.2} ms; cost scale {d:.2}\n", .{ k, w.buffered(), xt_drafts[k], if (xt_drafts[k] > 0) xt_draft[k] / @as(f32, @floatFromInt(xt_drafts[k])) else 0, scale });
+    }
 }
 
 /// Rows [lo, lo + n) of `logits` `[R, V]` (caller frees).
