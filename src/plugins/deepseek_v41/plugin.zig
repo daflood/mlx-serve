@@ -303,6 +303,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.owner = 0;
     m.parked = .empty;
     m.idle = null;
+    m.tp_snaps = 0;
     if (c.dsv41_streamed) {
         const dir = ctx.model_dir.slice();
         if (c.dsv41_exl3_bank) try openBank(m, quant, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes, start) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
