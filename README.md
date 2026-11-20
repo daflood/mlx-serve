@@ -1,3 +1,5 @@
+> **This is a fork branch, not upstream mlx-serve.** It adds experimental switches for running DeepSeek-V4.1-Flash across two M5 Ultra Macs; see [TWO-MACS.md](TWO-MACS.md). The rest of this README is upstream's.
+
 ![MLX-Serve, a local LLM and media server for Apple Silicon](website/assets/mlx-serve-header.jpg)
 
 # MLX-Serve
