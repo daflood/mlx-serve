@@ -515,6 +515,8 @@ pub const Dsv41Model = struct {
     tp: ?Shard = null,
     /// `moeFused`'s unit expand at rows 1..`dkern.max_rows` (`.pre` the zero stream), made once at load.
     tp_units: [dkern.max_rows]Split = undefined,
+    /// The same for the NAX `moe_down`, whose hc is fixed at 4: a unit post on every copy, so copy 0 is the MoE output.
+    tp_units4: [dkern.max_rows]Split = undefined,
     /// `dec_state`'s identity: a snapshot names the state it was taken of. Set from `gens` whenever `dec_state` is
     /// replaced, so a state parked by its slot and swapped back in keeps its own.
     state_gen: u64 = 0,
@@ -1940,6 +1942,10 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     if (opts.tp != null and m.dec.moe_fp4 != null) for (&m.tp_units, 1..) |*u, R| {
         const r = ci(R);
         u.* = .{ .pre = try ownConst(m, &.{ r, 1, ci(cfg.hidden_size) }, .bfloat16, 0), .post = try ownConst(m, &.{ r, 1 }, .float32, 1), .comb = try ownConst(m, &.{ r, 1, 1 }, .float32, 0) };
+    };
+    if (opts.tp != null and m.dec.moe_up != null and m.dec.moe_down != null) for (&m.tp_units4, 1..) |*u, R| {
+        const r = ci(R);
+        u.* = .{ .pre = try ownConst(m, &.{ r, 4, ci(cfg.hidden_size) }, .bfloat16, 0), .post = try ownConst(m, &.{ r, 4 }, .float32, 1), .comb = try ownConst(m, &.{ r, 4, 4 }, .float32, 0) };
     };
     try compileRegions(m);
     m.exact = exactWanted();
@@ -4957,15 +4963,23 @@ fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, p
     return hcExpand(sc, p[0], try tpSum(sc, m, part), &.{ .pre = p[1], .post = p[2], .comb = p[3] });
 }
 
-/// The routed and shared rows this rank holds on the fused mxfp4 launches (`[R, dim]`), or null where they decline:
-/// the down launch's hc expand over one copy with no residual and a unit post is the MoE output itself.
+/// The routed and shared rows this rank holds on the fused launches (`[R, dim]`), mxfp4 first, then NAX's affine
+/// ones, as `ffnDecode` tries them; null where both decline. The down launch's hc expand over unit copies with no
+/// residual is the MoE output itself.
 fn moeFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wts: A) !?A {
-    const kf = m.dec.moe_fp4 orelse return null;
-    const act = try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts) orelse return null;
     const R = dim(h, 0);
-    const one = &m.tp_units[R - 1];
-    const y = try dkern.moe_fp4.moeDown(sc, kf, ly, act, idx, one.pre, one) orelse return null;
-    return try sc.reshape(y, &.{ ci(R), ci(dim(h, 1)) });
+    if (m.dec.moe_fp4) |kf| if (try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts)) |act| {
+        const one = &m.tp_units[R - 1];
+        if (try dkern.moe_fp4.moeDown(sc, kf, ly, act, idx, one.pre, one)) |y| return try sc.reshape(y, &.{ ci(R), ci(dim(h, 1)) });
+    };
+    const ku = m.dec.moe_up orelse return null;
+    const kd = m.dec.moe_down orelse return null;
+    const v = ly.experts.views orelse return null;
+    if (R < 1 or R > dkern.max_rows) return null;
+    const act = try dkern.moe_up.moeUp(sc, m, ku, ly, h, idx, wts) orelse return null;
+    const units = &m.tp_units4[R - 1];
+    const y4 = try dkern.moe_down.moeDown(sc, kd, m.dec.moe_down_rb, &v[1], &ly.shared[2], act, idx, units.pre, units) orelse return null;
+    return try sc.reshape(try sc.slice(y4, 1, 0, 1), &.{ ci(R), ci(dim(h, 1)) });
 }
 
 /// wo_b through the routes on the fused `ffn_in` launches: the new stream, the FFN's normed input, split and routes.

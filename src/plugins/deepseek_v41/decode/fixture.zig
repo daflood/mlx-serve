@@ -385,16 +385,18 @@ test "dsv41 tensor parallel: two ranks on half the heads and experts, summing ea
     }
 }
 
-test "dsv41 tensor parallel: the ranks on the fused decode kernels decode no further from an f32 model than one model's chain" {
+test "dsv41 tensor parallel: the ranks on the fused decode kernels, mxfp4 or affine experts, decode no further from an f32 model than one model's chain" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     // A bf16 rounding can flip a near-tie route and move one seed's stream by percents, the chain's too: the bar is the
     // median over seeds.
+    // A device builds one MoE pair: mxfp4 without NAX, the affine moe_up/moe_down with it.
+    const fp4 = !device.naxAvailable();
     for ([_]usize{ 1, decode.max_rows }) |rows| {
         var tp: [5]f64 = undefined;
         var chain: [5]f64 = undefined;
         for (&tp, &chain, 1..) |*e_tp, *e_chain, seed| {
-            const base: Opts = .{ .lo = 20, .hi = 22, .experts = 8, .ctx = 0, .experts_fp4 = true, .seed = seed };
+            const base: Opts = .{ .lo = 20, .hi = 22, .experts = 8, .ctx = 0, .experts_fp4 = fp4, .seed = seed };
             var o = base;
             o.act = .float32;
             const truth = try Fixture.init(gpa, o);
@@ -422,7 +424,7 @@ test "dsv41 tensor parallel: the ranks on the fused decode kernels decode no fur
         }
         std.mem.sort(f64, &tp, {}, std.sort.asc(f64));
         std.mem.sort(f64, &chain, {}, std.sort.asc(f64));
-        std.debug.print("[dec] tensor parallel R={d}: median new-truth {e:.2}, chain-truth {e:.2} (rel rms)\n", .{ rows, tp[2], chain[2] });
+        std.debug.print("[dec] tensor parallel fp4={any} R={d}: median new-truth {e:.2}, chain-truth {e:.2} (rel rms)\n", .{ fp4, rows, tp[2], chain[2] });
         try std.testing.expect(tp[2] <= 1.25 * chain[2] + 1e-4);
     }
 }
