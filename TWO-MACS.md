@@ -2,20 +2,20 @@
 
 This branch is mlx-serve v26.11.3 + open PR #1146 + experimental switches for a pair of M5 Ultra Macs. It is not an official mlx-serve release. The numbers below come from `two-macs/bigpack-REPORT.md` ("Confirmed on the public pack") and `two-macs/REPORT.md`.
 
-The 4-bit pack, [`mlx-community/DeepSeek-V4.1-Flash-1017-oQ4e-ngram-mtp`](https://huggingface.co/mlx-community/DeepSeek-V4.1-Flash-1017-oQ4e-ngram-mtp), keeps every weight at the precision DeepSeek released (4-bit experts, 8-bit trunk, 8-bit Engram tables). It needs 288 GiB of memory, more than one 256 GB Mac's GPU limit (232 GiB). This branch of mlx-serve runs it across two M5 Ultra Studios joined by one Thunderbolt 5 RDMA cable:
+The 4-bit pack, [`mlx-community/DeepSeek-V4.1-Flash-1017-oQ4e-ngram-mtp`](https://huggingface.co/mlx-community/DeepSeek-V4.1-Flash-1017-oQ4e-ngram-mtp), keeps every weight at the precision DeepSeek released (4-bit experts, 8-bit trunk, 8-bit Engram tables). It needs 288 GiB of memory, more than one 256 GB Mac's GPU limit (232 GiB). This branch of mlx-serve runs it across two M5 Ultra Studios joined by Thunderbolt 5 RDMA (we had two cables; the model's traffic uses one):
 
 | | one Studio, 3-bit pack (the biggest that fits) | two Studios, 4-bit, stock 26.11.3 | **two Studios, 4-bit, this branch** |
 |---|---|---|---|
-| 1 user, tok/s | 79.0 | 74.0-74.5 | **92.8-93.6** |
-| 2 users, total | 94.2 | 99.2-99.5 | **116.4** |
-| 4 users, total | 124.0 | 135.0-135.9 | **150.8-151.1** |
-| 8 users, total | not measured | 171.2-172.1 | **178.5-179.6** |
-| decode bench (DSpark, 9 prompts) | 79.7 | 78.0 (68-90) | **103.5** (96-115) |
-| first token, new 26,800-token prompt | 6.89 s | 7.43 s | 7.40 s |
+| 1 user, tok/s | 79.0 | 74.0-74.5 | **89.6-95.8** |
+| 2 users, total | 94.2 | 99.2-99.5 | **114.9-117.5** |
+| 4 users, total | 124.0 | 135.0-135.9 | **147.1-152.7** |
+| 8 users, total | not measured | 171.2-172.1 | **176.7-179.6** |
+| decode bench (DSpark, 9 prompts) | 79.7 | 78.0 (68-90) | **101.5-103.8** (95-115) |
+| first token, new 26,800-token prompt | 6.89 s | 7.43 s | 7.38-7.70 s |
 | first token, new question behind a 26,800-token shared prompt | | 7.4-7.5 s | **0.25-0.26 s** |
-| first token, follow-up on a cached prompt | 0.12-0.15 s | 0.10-0.11 s | 0.09-0.11 s |
+| first token, follow-up on a cached prompt | 0.12-0.15 s | 0.10-0.11 s | 0.09-0.16 s |
 
-Real prompts, 768-token answers, reasoning effort max, temperature 0, DSpark on, prompt-lookup decoding off (`--no-pld`), two passes each. The patches add +25% for one user, +17% / +11% / +4% at 2 / 4 / 8.
+Real prompts, 768-token answers, reasoning effort max, temperature 0, DSpark on, prompt-lookup decoding off (`--no-pld`). This branch: four launches, eight passes (our working build and three runs of this commit, one built from a fresh clone of this branch); stock and one Studio: two passes. On the means the branch adds +25% for one user, +17% / +11% / +4% at 2 / 4 / 8, and is 17% / 23% / 21% faster than the 3-bit pack on one Studio at 1 / 2 / 4.
 
 Long context (same weights, earlier folder layout): 8 users at 111k tokens each fit with about 55 GiB to spare per Studio. A new 111k prompt takes 33 s; new prompts are read one at a time; follow-ups on a cached one start in 0.15 s.
 
@@ -39,9 +39,10 @@ A multi-user switch from our earlier notes, `DSV41_TP_BATCHFUSED`, corrupted out
 ## Before you start
 
 - Two M5 Ultra Macs, 256 GB each, Thunderbolt 5, RDMA enabled (macOS 26.2 or later; enable RDMA once per Mac in Recovery). Tested on macOS 27.2.
-- One Thunderbolt 5 cable between them. A second cable made no difference in our tests.
+- One Thunderbolt 5 cable between them is enough. We had two connected; the second made no difference to speed, because each cross-Mac sum is about 20 KB and MLX only splits messages across cables from 512 KiB.
 - **If you connect two cables, take the cable ports out of Thunderbolt Bridge.** macOS adds every Thunderbolt port to `bridge0`, so two cables between the same Macs form a loop: about 200,000 packets a second per port, `mDNSResponder` and `netbiosd` each eating a core. RDMA keeps working, so it's easy to miss. Check with `ps -Ao pcpu,command -r | head -4`. Fix: `sudo ifconfig bridge0 deletem <enX>` per cable port, made permanent with a launch daemon.
 - Give each cable port an IPv4 address on its own small subnet (a /30), also from a launch daemon, because `ifconfig` addresses are lost at reboot. `ibv_devinfo | grep -B1 ACTIVE` shows the RDMA device names (`rdma_enX`).
+- `brew install cmake webp` on the Mac you build on, and `brew install webp` on the other (the server links Homebrew's webp).
 - Nothing else holding memory on either Mac (other model servers, login agents). The pack leaves about 75 GiB of the GPU limit free on each.
 - About 480 GB free disk on each Mac.
 

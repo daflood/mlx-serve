@@ -308,7 +308,7 @@ Second opinions on this plan: Neon's is `second-opinion/REVIEW2-neon.md` (it fou
 # Background (written before the night runs)
 
 ## Setup
-- 2x Mac Studio M5 Ultra 256 GB, macOS 27.2, TB5 RDMA (link at 21:01: one cable, Mac 1 `rdma_en13` <-> Mac 2 `rdma_en4`, Thunderbolt Bridge still on)
+- 2x Mac Studio M5 Ultra 256 GB, macOS 27.2, TB5 RDMA (at 21:01 one cable linked, Mac 1 `rdma_en13` <-> Mac 2 `rdma_en4`, Thunderbolt Bridge still on; both cables linked from 21:50, see "Cables" below; the model's traffic uses one)
 - mlx-serve 26.11.3 (Homebrew bottle) and a source build of tag v26.11.3 (MLX c69303b, built on the MacBook with Xcode 27.0)
 - Pack: `ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw` rev 6da9c4e4 (40 layers, hidden 5120, 64 heads, 384 experts top-6, DSpark block 5)
 
