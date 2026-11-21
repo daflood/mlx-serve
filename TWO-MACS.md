@@ -15,7 +15,7 @@ The 4-bit pack, [`mlx-community/DeepSeek-V4.1-Flash-1017-oQ4e-ngram-mtp`](https:
 | first token, new question behind a 26,800-token shared prompt | | 7.4-7.5 s | **0.25-0.26 s** |
 | first token, follow-up on a cached prompt | 0.12-0.15 s | 0.10-0.11 s | 0.09-0.16 s |
 
-Real prompts, 768-token answers, reasoning effort max, temperature 0, DSpark on, prompt-lookup decoding off (`--no-pld`). This branch: four launches, eight passes (our working build and three runs of this commit, one built from a fresh clone of this branch); stock and one Studio: two passes. On the means the branch adds +25% for one user, +17% / +11% / +4% at 2 / 4 / 8, and is 17% / 23% / 21% faster than the 3-bit pack on one Studio at 1 / 2 / 4.
+Real prompts, 768-token answers, reasoning effort max, temperature 0, DSpark on (prompt-lookup decoding has no effect on this model: DSpark always takes priority). This branch: four launches, eight passes (our working build and three runs of this commit, one built from a fresh clone of this branch); stock and one Studio: two passes. On the means the branch adds +25% for one user, +17% / +11% / +4% at 2 / 4 / 8, and is 17% / 23% / 21% faster than the 3-bit pack on one Studio at 1 / 2 / 4.
 
 Long context (same weights, earlier folder layout): 8 users at 111k tokens each fit with about 55 GiB to spare per Studio. A new 111k prompt takes 33 s; new prompts are read one at a time; follow-ups on a cached one start in 0.15 s.
 
@@ -79,7 +79,7 @@ M=<MODELS>/DeepSeek-V4.1-Flash-1017-oQ4e-ngram-mtp
 
 # Mac 1 (rank 0)
 ./zig-out/bin/mlx-serve --serve --host 127.0.0.1 --port 11240 \
-  --ctx-size 65536 --max-concurrent 16 --no-pld \
+  --ctx-size 65536 --max-concurrent 16 \
   --model-dir <MODELS> --dist tensor --dist-model $M \
   --dist-coordinator <MAC1_CABLE_IP>:55100 --dist-device <rdma_enX>
 
@@ -90,7 +90,7 @@ M=<MODELS>/DeepSeek-V4.1-Flash-1017-oQ4e-ngram-mtp
 
 Send one chat request with the model name `DeepSeek-V4.1-Flash-1017-oQ4e-ngram-mtp`. That loads both halves (about 30 s). The API is OpenAI-compatible at `http://127.0.0.1:11240/v1` on Mac 1.
 
-- `--no-pld` matches how we measured. Prompt-lookup decoding (on by default) copies tokens from the prompt and can be much faster when the answer repeats it, as in code edits. Try both on your own work.
+- DSpark's speed depends on the prompt. On long prompts it can copy from, stock read 84-111 tok/s for one user and this branch 105-137 (about +18%); the table's short open questions read lower on both.
 - For long contexts raise `--ctx-size` (we ran 262,144) and the prompt cache (`--prefix-cache-entries`, `--prefix-cache-mem`).
 - Optional warm-up: the first long prompt after a launch is slow. Three prompts of about 700, 2,600 and 9,100 tokens at start (about 6 s) remove that.
 
