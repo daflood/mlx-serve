@@ -690,7 +690,7 @@ test "dsv41 tensor parallel: a worker keeps its copy of rank 0's snapshots by id
     try std.testing.expectEqual(@as(u64, 7), m.state_gen);
     try std.testing.expectEqual(@as(usize, 50), m.dec_state.?.n);
     try std.testing.expect(parked.contains(5));
-    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .capture, 7, 0);
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .capture, 7, 50);
     try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .take, 7, 3);
     try std.testing.expectEqual(@as(usize, 50), snaps.get(3).?.n);
     try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .free, 3, 0);
@@ -698,6 +698,36 @@ test "dsv41 tensor parallel: a worker keeps its copy of rank 0's snapshots by id
     try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .free, 2, 0);
     try std.testing.expectEqual(@as(usize, 0), snaps.count());
     try std.testing.expectError(error.DistPeerDiverged, dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .restore, 1, 8));
+}
+
+test "dsv41 tensor parallel: a worker's capture keeps an open verify chunk to rank 0's position before it snapshots" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .tp = .{ .rank = 1, .size = 2 } });
+    defer fx.deinit();
+    const m = fx.m;
+    var parked: dsv41.Parked = .init(gpa);
+    defer dsv41.dropParked(&parked);
+    var snaps: dsv41.Snaps = .init(gpa);
+    defer dsv41.dropSnaps(&snaps, gpa);
+    if (m.dec_state) |*st| st.deinit();
+    m.dec_state = null;
+    try dsv41.tpActivate(m, &parked, 5);
+    m.dec_state = try dsv41.initState(m, gpa);
+    const st = &m.dec_state.?;
+    // A 6-row verify from 50 the worker has not yet heard the outcome of; rank 0 kept 3 rows.
+    st.n = 50;
+    try dsv41.armVerify(st, m.n_layers);
+    st.n = 56;
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .capture, 5, 53);
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .take, 5, 1);
+    try std.testing.expect(st.verify == null);
+    try std.testing.expectEqual(@as(usize, 53), snaps.get(1).?.n);
+    // Restored, the next turn's step at 53 needs no snapshot to rewind to.
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .restore, 1, 7);
+    try std.testing.expectEqual(@as(usize, 53), m.dec_state.?.n);
+    // A rank 0 position past this rank's state is a divergence.
+    try std.testing.expectError(error.DistPeerDiverged, dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .capture, 7, 60));
 }
 
 test "dsv41 tensor parallel: a chunk's image rows, sent alone, splice as the request's rows at their offset" {

@@ -6166,7 +6166,13 @@ fn tpDiverged(line: u32) error{DistPeerDiverged} {
 pub fn tpWorkerSnap(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, snaps: *Snaps, op: SnapOp, a: u64, b: u64) !void {
     switch (op) {
         .capture => {
+            // Rank 0 snapshots at `b`, where it kept its last verify chunk; this rank has not heard how much of the
+            // chunk was kept (the next step would say), so it keeps that much first. Without this the snapshot stood
+            // past rank 0's (unkept draft rows in, DSpark windows short) and the next turn's step diverged.
             const st = try tpStateOf(m, parked, a);
+            if (st.verify) |v| log.info("[dist] capture at {d}: closes the open verify, keeps {d} of {d} rows\n", .{ b, b -| v.n0, st.n - v.n0 });
+            try followVerifyOf(m, st, b);
+            if (st.n != b) return tpDiverged(@src().line);
             st.snap_at = st.n;
             try snapshotStateIfDue(st, a);
         },
@@ -7253,7 +7259,8 @@ pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: 
     st.snap_vision_key = key;
     try snapshotIfDue(m);
     // A restored prompt can stand at its boundary already: no step will carry the snapshot to the other ranks.
-    if (st.snap != null) tpSnap(m, .capture, m.state_gen, 0);
+    // Its position rides along: the other ranks may still hold the last verify chunk open past it.
+    if (st.snap != null) tpSnap(m, .capture, m.state_gen, st.n);
 }
 
 pub fn prefixKey(m: *const Dsv41Model, ids: []const u32, rows: ?A) !u64 {
